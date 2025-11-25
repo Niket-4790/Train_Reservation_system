@@ -28,7 +28,7 @@ std::mutex access_mutex; // Protects the access_count
 std::condition_variable access_cond; // Signals when an access slot is freed
 int active_access_count = 0; // Current number of threads inside the critical region
 
-// 3. Thread Management Variables (RESTORED TO GLOBAL SCOPE)
+// 3. Thread Management Variables
 std::thread threads[MAX_THREADS];
 int num_threads = 0;
 
@@ -53,7 +53,7 @@ void print_query(int thread_num, int type, int train_num, const string& action) 
     cout << " on Train " << train_num << endl;
 }
 
-// --- WORKER THREAD (Modified) ---
+// --- WORKER THREAD (FIXED) ---
 void worker_thread(int thread_num) {
     auto start = std::chrono::steady_clock::now();
 
@@ -62,28 +62,39 @@ void worker_thread(int thread_num) {
         int train_num = get_random_train();
         int type = std::rand() % 3 + 1;
 
+        // Check time limit before starting a new request
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - start);
+        if (elapsed_seconds.count() >= MAX_TIME * 60) {
+            break;
+        }
+
         // --- PHASE 1: GLOBAL LOAD CONTROL (Using Condition Variable) ---
-        print_query(thread_num, type, train_num, "WAITING for system access.");
+        { // Start a new scope for unique_lock
+            print_query(thread_num, type, train_num, "WAITING for system access.");
 
-        std::unique_lock<std::mutex> load_lock(access_mutex);
+            // Acquire access_mutex
+            std::unique_lock<std::mutex> load_lock(access_mutex);
 
-        // Wait until an access slot is free
-        // The condition variable releases the lock and waits until signaled AND the condition is true.
-        access_cond.wait(load_lock, [&]{
-            return active_access_count < MAX_CONCURRENT_ACCESS;
-        });
+            // Wait until an access slot is free (releases lock while waiting)
+            access_cond.wait(load_lock, [&]{
+                return active_access_count < MAX_CONCURRENT_ACCESS;
+            });
 
-        active_access_count++; // Claim the slot
+            // Lock re-acquired, condition met.
+            active_access_count++; // Claim the slot
+
+            // load_lock is released here when scope ends, ensuring active_access_count is protected.
+        } // End of scope: load_lock releases access_mutex automatically.
+
         print_query(thread_num, type, train_num, "GAINED system access.");
-        load_lock.unlock(); // Release the global load lock (load_lock)
 
         // --- PHASE 2: LOCAL DATA INTEGRITY (Using Train Mutex) ---
 
         // Acquire lock for the specific train to ensure data integrity
-        // This is the CRITICAL SECTION entry for data modification.
         std::lock_guard<std::mutex> train_lock(train_mutex[train_num]);
 
-        // Execute Query (Inside the critical section for data)
+        // Execute Query (Critical Section for data)
         lock_guard<std::mutex> print_lock(print_mutex);
 
         switch (type) {
@@ -119,28 +130,24 @@ void worker_thread(int thread_num) {
                 break;
             }
         }
-        // train_lock (Phase 2) is released here.
-        // print_lock is released here.
+        // train_lock and print_lock are released here.
 
         // --- PHASE 3: RELEASE GLOBAL ACCESS (Signaling) ---
 
-        load_lock.lock(); // Re-acquire the global load lock (load_lock)
-        active_access_count--; // Release the slot
-        load_lock.unlock(); // Release lock
+        { // Start a new scope for load_lock
+            // Re-acquire the global load lock to safely decrement the counter
+            std::lock_guard<std::mutex> release_lock(access_mutex);
+            active_access_count--; // Release the slot
+        } // End of scope: release_lock releases access_mutex automatically.
 
         // Signal one waiting thread that a slot in the global access pool is free
         access_cond.notify_one();
 
-        // --- End of Loop Checks ---
-        auto end = std::chrono::steady_clock::now();
-        auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(end - start);
-        if (elapsed_seconds.count() >= MAX_TIME * 60) {
-            break;
-        }
+        // Time check moved to the start of the loop for cleaner structure.
     }
 }
 
-// --- MAIN FUNCTION ---
+// --- MAIN FUNCTION (Unchanged) ---
 int main() {
     std::srand(std::time(nullptr));
     for (int i = 0; i < MAX_TRAINS; i++) {
