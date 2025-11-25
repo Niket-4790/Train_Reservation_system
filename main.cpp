@@ -3,7 +3,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
-#include <cstdlib> // For std::rand and std::srand
+#include <cstdlib>
 
 using namespace std;
 using namespace std::chrono;
@@ -14,22 +14,22 @@ using namespace std::chrono;
 #define BOOK_MIN 5
 #define BOOK_MAX 10
 #define MAX_THREADS 20
+// NEW GLOBAL CONSTRAINT: Max number of threads allowed to enter the booking system logic
+#define MAX_CONCURRENT_ACCESS 5 
 #define MAX_TIME 1 // mins
 
 // --- GLOBAL SHARED RESOURCES ---
-// 1. Mutexes to protect available_seats for *each* train
+// 1. Mutexes for Data Integrity (Fine-grained locking)
 std::mutex train_mutex[MAX_TRAINS];
-
-// 2. Train data
 int available_seats[MAX_TRAINS];
 
-// 3. Thread management
-std::thread threads[MAX_THREADS];
-int num_threads = 0;
-std::mutex print_mutex; // For clean console output
+// 2. Resources for Global Load Management (Condition Variable Logic)
+std::mutex access_mutex; // Protects the access_count
+std::condition_variable access_cond; // Signals when an access slot is freed
+int active_access_count = 0; // Current number of threads inside the critical region
 
-// Removed: query_mutex, query_cond, active_queries, num_active_queries
-// The active query pool and its logic are replaced by train-specific locks.
+// 3. Output Control
+std::mutex print_mutex;
 
 // --- HELPER FUNCTIONS (Unchanged) ---
 int get_random_train() {
@@ -40,16 +40,13 @@ int get_random_bookings() {
     return std::rand() % (BOOK_MAX - BOOK_MIN + 1) + BOOK_MIN;
 }
 
-void print_query(int thread_num, int type, int train_num) {
+void print_query(int thread_num, int type, int train_num, const string& action) {
     lock_guard<std::mutex> lock(print_mutex);
-    cout << "Thread " << thread_num << ": ";
-    if (type == 1) {
-        cout << "Inquiring " << train_num << endl;
-    } else if (type == 2) {
-        cout << "Attempting Booking on " << train_num << endl;
-    } else if (type == 3) {
-        cout << "Attempting Cancellation on " << train_num << endl;
-    }
+    cout << "Thread " << thread_num << ": " << action;
+    if (type == 1) cout << " Inquiry";
+    else if (type == 2) cout << " Booking";
+    else if (type == 3) cout << " Cancellation";
+    cout << " on Train " << train_num << endl;
 }
 
 // --- WORKER THREAD (Modified) ---
@@ -57,51 +54,55 @@ void worker_thread(int thread_num) {
     auto start = std::chrono::steady_clock::now();
 
     while (true) {
-        // 1. Simulate user thinking/activity
         std::this_thread::sleep_for(std::chrono::milliseconds(std::rand() % 500));
-
-        // 2. Generate Query
         int train_num = get_random_train();
-        int type = std::rand() % 3 + 1; // 1: Inquire, 2: Book, 3: Cancel
+        int type = std::rand() % 3 + 1;
 
-        // Print intent before locking
-        print_query(thread_num, type, train_num);
+        // --- PHASE 1: GLOBAL LOAD CONTROL (Using Condition Variable) ---
+        print_query(thread_num, type, train_num, "WAITING for system access.");
 
-        // 3. CORE SYNCHRONIZATION: Acquire Lock for the specific train
-        // For read/write access to available_seats[train_num]
+        std::unique_lock<std::mutex> load_lock(access_mutex);
+        
+        // Wait until an access slot is free
+        access_cond.wait(load_lock, [&]{ 
+            return active_access_count < MAX_CONCURRENT_ACCESS; 
+        });
+
+        active_access_count++; // Claim the slot
+        print_query(thread_num, type, train_num, "GAINED system access.");
+        load_lock.unlock(); // Release the global load lock
+
+        // --- PHASE 2: LOCAL DATA INTEGRITY (Using Train Mutex) ---
+
+        // Acquire lock for the specific train to ensure data integrity
         std::lock_guard<std::mutex> train_lock(train_mutex[train_num]);
 
-        // 4. Execute Query (Inside the critical section)
-        lock_guard<std::mutex> print_lock(print_mutex); // Lock for printing
-
+        // Execute Query (Critical Section for data)
+        lock_guard<std::mutex> print_lock(print_mutex); 
+        
         switch (type) {
             case 1: { // Inquiry (Read)
-                // Read operation is safe because the train mutex is held.
-                cout << "Thread " << thread_num << ": Train " << train_num
+                cout << "Thread " << thread_num << ": Train " << train_num 
                      << " has " << available_seats[train_num] << " seats available." << endl;
                 break;
             }
             case 2: { // Booking (Write)
                 int num_to_book = get_random_bookings();
                 if (available_seats[train_num] >= num_to_book) {
-                    available_seats[train_num] -= num_to_book; // Write operation is safe.
+                    available_seats[train_num] -= num_to_book;
                     cout << "Thread " << thread_num << ": SUCCESSFULLY BOOKED " << num_to_book
                          << " seats in Train " << train_num << ". Remaining: "
                          << available_seats[train_num] << endl;
                 } else {
-                    cout << "Thread " << thread_num << ": FAILED to book " << num_to_book
-                         << " in Train " << train_num << ". Only "
-                         << available_seats[train_num] << " available." << endl;
+                    cout << "Thread " << thread_num << ": FAILED to book in Train " << train_num << "." << endl;
                 }
                 break;
             }
             case 3: { // Cancellation (Write)
                 int booked_seats = CAPACITY - available_seats[train_num];
                 if (booked_seats > 0) {
-                    // Cancel a random number of seats up to the number booked
                     int num_to_cancel = std::rand() % booked_seats + 1;
-
-                    available_seats[train_num] += num_to_cancel; // Write operation is safe.
+                    available_seats[train_num] += num_to_cancel;
                     cout << "Thread " << thread_num << ": SUCCESSFULLY CANCELLED " << num_to_cancel
                          << " seats in Train " << train_num << ". Remaining: "
                          << available_seats[train_num] << endl;
@@ -112,10 +113,19 @@ void worker_thread(int thread_num) {
                 break;
             }
         }
-        // 5. Release Locks: train_lock and print_lock are automatically released here
-        // due to lock_guard going out of scope.
+        // train_lock (Phase 2) is released here.
+        // print_lock is released here.
 
-        // 6. Check Time Limit
+        // --- PHASE 3: RELEASE GLOBAL ACCESS (Signaling) ---
+
+        load_lock.lock(); // Re-acquire the global load lock
+        active_access_count--; // Release the slot
+        load_lock.unlock(); // Release lock
+        
+        // Signal one or all waiting threads that a slot is free
+        access_cond.notify_one(); 
+        
+        // --- End of Loop Checks ---
         auto end = std::chrono::steady_clock::now();
         auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(end - start);
         if (elapsed_seconds.count() >= MAX_TIME * 60) {
