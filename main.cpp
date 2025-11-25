@@ -3,35 +3,35 @@
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
+#include <cstdlib> // For std::rand and std::srand
+
 using namespace std;
 using namespace std::chrono;
 
+// --- DEFINITIONS ---
 #define MAX_TRAINS 100
 #define CAPACITY 500
 #define BOOK_MIN 5
 #define BOOK_MAX 10
 #define MAX_THREADS 20
-#define MAX_ACTIVE_QUERIES 5
 #define MAX_TIME 1 // mins
 
-std::mutex train_num[MAX_TRAINS];
-std::mutex query_mutex;
-std::condition_variable query_cond;
+// --- GLOBAL SHARED RESOURCES ---
+// 1. Mutexes to protect available_seats for *each* train
+std::mutex train_mutex[MAX_TRAINS];
 
-struct query {
-    int type;
-    int train_num;
-    int thread_num;
-};
-
-struct query active_queries[MAX_ACTIVE_QUERIES];
-int num_active_queries = 0;
-
+// 2. Train data
 int available_seats[MAX_TRAINS];
+
+// 3. Thread management
 std::thread threads[MAX_THREADS];
 int num_threads = 0;
-std::mutex print_mutex;
+std::mutex print_mutex; // For clean console output
 
+// Removed: query_mutex, query_cond, active_queries, num_active_queries
+// The active query pool and its logic are replaced by train-specific locks.
+
+// --- HELPER FUNCTIONS (Unchanged) ---
 int get_random_train() {
     return std::rand() % MAX_TRAINS;
 }
@@ -40,102 +40,82 @@ int get_random_bookings() {
     return std::rand() % (BOOK_MAX - BOOK_MIN + 1) + BOOK_MIN;
 }
 
-int get_random_thread() {
-    return std::rand() % num_threads;
-}
-
-void print_query(struct query q) {
-    // print_mutex.lock();
-    cout << "Thread " << q.thread_num << ": ";
-    if (q.type == 1) {
-        cout << "Inquiring " << q.train_num << std::endl;
-    } else if (q.type == 2) {
-        cout << "Booking seats in " << q.train_num << std::endl;
-    } else if (q.type == 3) {
-        cout << "Cancelling bookings in " << q.train_num << std::endl;
-    } else {
-        cout << "Invalid query type" << std::endl;
+void print_query(int thread_num, int type, int train_num) {
+    lock_guard<std::mutex> lock(print_mutex);
+    cout << "Thread " << thread_num << ": ";
+    if (type == 1) {
+        cout << "Inquiring " << train_num << endl;
+    } else if (type == 2) {
+        cout << "Attempting Booking on " << train_num << endl;
+    } else if (type == 3) {
+        cout << "Attempting Cancellation on " << train_num << endl;
     }
-    // print_mutex.unlock();
 }
 
+// --- WORKER THREAD (Modified) ---
 void worker_thread(int thread_num) {
     auto start = std::chrono::steady_clock::now();
+
     while (true) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(std::rand() % 10000));
-        struct query q;
-        q.thread_num = thread_num;
+        // 1. Simulate user thinking/activity
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::rand() % 500));
+
+        // 2. Generate Query
         int train_num = get_random_train();
-        q.train_num = train_num;
-        int type = std::rand() % 3 + 1;
-        q.type = type;
-        // print_query(q);
-        std::unique_lock<std::mutex> lock(query_mutex);
-        while (num_active_queries >= MAX_ACTIVE_QUERIES) {
-            query_cond.wait(lock);
-        }
-        bool conflict = false;
-        for (int i = 0; i < num_active_queries; i++) {
-            struct query active_query = active_queries[i];
-            if (active_query.train_num == train_num) {
-                if (active_query.type == 2 || type == 2) {
-                    conflict = true;
-                }
-            }
-        }
-        if (conflict) {
-            query_cond.wait(lock);
-        }
-        active_queries[num_active_queries++] = q;
-        lock.unlock();
-        //print here
-        print_mutex.lock();
-        print_query(q);
+        int type = std::rand() % 3 + 1; // 1: Inquire, 2: Book, 3: Cancel
+
+        // Print intent before locking
+        print_query(thread_num, type, train_num);
+
+        // 3. CORE SYNCHRONIZATION: Acquire Lock for the specific train
+        // For read/write access to available_seats[train_num]
+        std::lock_guard<std::mutex> train_lock(train_mutex[train_num]);
+
+        // 4. Execute Query (Inside the critical section)
+        lock_guard<std::mutex> print_lock(print_mutex); // Lock for printing
+
         switch (type) {
-            case 1:
-                cout << "Thread " << thread_num << ": " << available_seats[train_num] << " seats available in " << train_num << std::endl;
-                // print_mutex.unlock();
+            case 1: { // Inquiry (Read)
+                // Read operation is safe because the train mutex is held.
+                cout << "Thread " << thread_num << ": Train " << train_num
+                     << " has " << available_seats[train_num] << " seats available." << endl;
                 break;
-            case 2:
-                if (available_seats[train_num] >= BOOK_MIN) {
-                    int num_booked = get_random_bookings();
-                    if (num_booked > available_seats[train_num]) {
-                        num_booked = available_seats[train_num];
-                    }
-                    cout << "Thread " << thread_num << ": booking " << num_booked << " seats in " << train_num << std::endl;
-                    available_seats[train_num] -= num_booked;
-                    cout << "Thread " << thread_num << ": booked " << num_booked << " seats in " << train_num << std::endl;
+            }
+            case 2: { // Booking (Write)
+                int num_to_book = get_random_bookings();
+                if (available_seats[train_num] >= num_to_book) {
+                    available_seats[train_num] -= num_to_book; // Write operation is safe.
+                    cout << "Thread " << thread_num << ": SUCCESSFULLY BOOKED " << num_to_book
+                         << " seats in Train " << train_num << ". Remaining: "
+                         << available_seats[train_num] << endl;
                 } else {
-                    cout << "Thread " << thread_num << ": " << train_num << " has no available seats" << std::endl;
+                    cout << "Thread " << thread_num << ": FAILED to book " << num_to_book
+                         << " in Train " << train_num << ". Only "
+                         << available_seats[train_num] << " available." << endl;
                 }
-                // print_mutex.unlock();
                 break;
-            case 3:
-                if (available_seats[train_num] < 500) {
-                    int num_cancelled = 500 - available_seats[train_num];
-                    num_cancelled=rand() % num_cancelled + 1;
-                    cout << "Thread " << thread_num << ": cancelling " << num_cancelled << " seats in " << train_num << std::endl;
-                    available_seats[train_num] += num_cancelled;
-                    cout << "Thread " << thread_num << ": cancelled " << num_cancelled << " seats in " << train_num << std::endl;
+            }
+            case 3: { // Cancellation (Write)
+                int booked_seats = CAPACITY - available_seats[train_num];
+                if (booked_seats > 0) {
+                    // Cancel a random number of seats up to the number booked
+                    int num_to_cancel = std::rand() % booked_seats + 1;
+
+                    available_seats[train_num] += num_to_cancel; // Write operation is safe.
+                    cout << "Thread " << thread_num << ": SUCCESSFULLY CANCELLED " << num_to_cancel
+                         << " seats in Train " << train_num << ". Remaining: "
+                         << available_seats[train_num] << endl;
                 } else {
-                    cout << "Thread " << thread_num << ": no bookings to cancel in " << train_num << std::endl;
+                    cout << "Thread " << thread_num << ": Train " << train_num
+                         << " has no bookings to cancel." << endl;
                 }
-                // print_mutex.unlock();
-                break;
-            default:
-                cout << "Thread " << thread_num << ": Invalid query type" << std::endl;
-                // print_mutex.unlock();
-        }
-        print_mutex.unlock();
-        lock.lock();
-        for (int i = 0; i < num_active_queries; i++) {
-            if (active_queries[i].thread_num == thread_num) {
-                active_queries[i] = active_queries[--num_active_queries];
                 break;
             }
         }
-        query_cond.notify_all();
-        lock.unlock();
+        // 5. Release Locks: train_lock and print_lock are automatically released here
+        // due to lock_guard going out of scope.
+
+        // 6. Check Time Limit
         auto end = std::chrono::steady_clock::now();
         auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(end - start);
         if (elapsed_seconds.count() >= MAX_TIME * 60) {
@@ -144,23 +124,28 @@ void worker_thread(int thread_num) {
     }
 }
 
+// --- MAIN FUNCTION (Mostly Unchanged) ---
 int main() {
     std::srand(std::time(nullptr));
     for (int i = 0; i < MAX_TRAINS; i++) {
         available_seats[i] = CAPACITY;
     }
+
     for (int i = 0; i < MAX_THREADS; i++) {
         threads[i] = std::thread(worker_thread, i);
         num_threads++;
     }
+
     for (int i = 0; i < num_threads; i++) {
         threads[i].join();
     }
-    cout<<"The reservation chart at the end\n";
-    cout<<"    Train number"<<" "<<"Available Seats\n";
-    for(int i=0;i<MAX_TRAINS;i++){
-        cout<<"     "<<i<<"             "<<available_seats[i]<<std::endl;
+
+    cout << "\n--- Final Reservation Chart ---\n";
+    cout << "    Train number    Available Seats\n";
+    for(int i = 0; i < MAX_TRAINS; i++){
+        cout << "        " << i << "                " << available_seats[i] << endl;
     }
-    cout<<"Thanks for using our services!!!\n";
+    cout << "Thanks for using our services!!!\n";
+
     return 0;
 }
